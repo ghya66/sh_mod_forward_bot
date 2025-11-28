@@ -10,7 +10,9 @@
   "scripts": {
     "build": "rimraf dist && tsc -p tsconfig.json",
     "start": "node --max-old-space-size=512 dist/index.js",
-    "postinstall": "npm rebuild better-sqlite3 --update-binary || true"
+    "postinstall": "npm rebuild better-sqlite3 --update-binary || true",
+    "test": "npm run build && node dist/test/detectAd.spec.js",
+    "sandbox:detectAd": "npm run build && node dist/scripts/detectAd-sandbox.js"
   },
   "dependencies": {
     "better-sqlite3": "^9.5.0",

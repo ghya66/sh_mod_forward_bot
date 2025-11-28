@@ -6,6 +6,11 @@ import { Telegraf, Markup, Context } from "telegraf";
 import type { TrafficBtn, AdTemplate, Req, Config, Suspected } from "./types";
 import { buildStore, Store } from "./store";
 import { isAdminUser, ensureAdminOrAlert } from "./utils/adminAuth";
+import {
+  DetectAdResult,
+  detectAd,
+  setDetectAdContext,
+} from "./services/detectAd";
 
 /** ====== Boot ====== */
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
@@ -210,6 +215,10 @@ let allowlistMode = false;
 // 来源白名单
 let sourcesAllow = new Set<string>();
 
+function syncDetectAdContext() {
+  setDetectAdContext({ templates, defaultThreshold: cfg?.adtplDefaultThreshold ?? 0.6 });
+}
+
 // metrics
 const metrics = {
   pending: 0,
@@ -331,39 +340,6 @@ function human(u?: { username?: string; first_name?: string; last_name?: string;
 }
 function isValidUrl(u: string) { return /^https?:\/\/\S+/i.test(u); }
 
-// normalize & n-gram
-function toHalfWidth(str: string): string {
-  return str.replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/\u3000/g, " ");
-}
-function normalizeText(s: string): string {
-  const lower = toHalfWidth(s).toLowerCase();
-  const stripped = lower.replace(/[^\p{Letter}\p{Number}\u4e00-\u9fa5]+/gu, "");
-  return stripped;
-}
-function ngrams(s: string, n: number): Set<string> {
-  const set = new Set<string>(); if (!s) return set;
-  const N = Math.max(1, Math.min(n, s.length));
-  for (let i=0;i<=s.length-N;i++) set.add(s.slice(i,i+N));
-  return set;
-}
-function jaccard(a: Set<string>, b: Set<string>): number {
-  if (a.size===0 && b.size===0) return 1; let inter=0;
-  for (const x of a) if (b.has(x)) inter++; const uni=a.size+b.size-inter;
-  return uni===0?0:inter/uni;
-}
-function detectAdTemplate(text: string): { matched: boolean; name?: string; score?: number } {
-  const norm = normalizeText(text); if (!norm) return { matched:false };
-  const a = ngrams(norm, norm.length >=3 ? 3 : 2);
-  let best = { name: "", score: 0, thr: cfg.adtplDefaultThreshold ?? 0.6 };
-  for (const tpl of templates) {
-    const b = ngrams(normalizeText(tpl.content), tpl.content.length>=3?3:2);
-    const score = jaccard(a,b);
-    const thr = Math.max(0, Math.min(1, tpl.threshold ?? cfg.adtplDefaultThreshold ?? 0.6));
-    if (score>=thr && score>best.score) best = { name: tpl.name, score, thr };
-  }
-  if (best.score >= (best.thr || cfg.adtplDefaultThreshold || 0.6)) return { matched:true, name:best.name, score:Number(best.score.toFixed(3)) };
-  return { matched:false };
-}
 function extractMessageText(msg: any): string {
   // 1. 纯文字消息
   if (msg?.text) return msg.text;
@@ -405,6 +381,7 @@ async function loadAll() {
   }
   if (!cfg.forwardTargetId) throw new Error("配置缺少 forwardTargetId（FORWARD_TARGET_ID）");
   sourcesAllow = new Set((cfg.sourcesAllow || []).map(String));
+  syncDetectAdContext();
   loadMetricsFromCfg();
   debug("Loaded sourcesAllow:", [...sourcesAllow], "strict:", cfg.strictTemplate);
 }
@@ -509,10 +486,11 @@ async function handleIncoming(ctx: Context, msg: any, sourceChatId: number|strin
   }
 
   const txt = extractMessageText(msg);
-  const hit = detectAdTemplate(txt);
+  const detection: DetectAdResult = await detectAd(txt);
+  const legacyMatched = Boolean(detection.legacyTemplateName);
 
-  // 严格模板模式：未命中直接丢弃（可选）
-  if (cfg.strictTemplate && !hit.matched) {
+  // 严格模板模式：未命中模板直接丢弃（可选）
+  if (cfg.strictTemplate && !legacyMatched) {
     if (fromId) await safeCall(()=>ctx.reply("❌ 未命中模板，未提交审核"));
     return;
   }
@@ -524,21 +502,27 @@ async function handleIncoming(ctx: Context, msg: any, sourceChatId: number|strin
     fromId: fromId || 0,
     fromName: msg?.sender_chat?.title ? `${msg.sender_chat.title}` : (fromId ? human((ctx as any).from) : "未知"),
     createdAt: nowTs,
-    suspected: hit.matched ? { template: hit.name!, score: hit.score! } : undefined
+    suspected: legacyMatched && detection.legacyScore !== undefined
+      ? { template: detection.legacyTemplateName!, score: detection.legacyScore }
+      : undefined
   };
   await store.setPending(req);
   metrics.pending += 1; await persistMetrics();
 
   if (fromId) {
-    await safeCall(()=>ctx.reply(hit.matched ?
-      `📝 已提交审核（⚠️ 疑似模板：${req.suspected!.template}，score=${req.suspected!.score}）`
+    await safeCall(()=>ctx.reply(legacyMatched && req.suspected ?
+      `📝 已提交审核（⚠️ 疑似模板：${req.suspected.template}，score=${req.suspected.score}）`
       : "📝 已提交审核，请等待管理员处理"));
   }
 
   const reviewText = `🕵️ 审核请求 #${id}
 来自：${req.fromName}${fromId?` (ID:${fromId})`: "" }
-来源 chatId: ${sourceChatId}` + (hit.matched ? `
-⚠️ 疑似广告模板：${hit.name}（score=${hit.score}）` : "");
+来源 chatId: ${sourceChatId}` + (legacyMatched ? `
+⚠️ 疑似广告模板：${detection.legacyTemplateName}（score=${detection.legacyScore}）` : "") +
+    (detection.aiConfidence !== undefined
+      ? `
+🤖 AI 判断：${detection.isAd ? "广告" : "非广告"}（${detection.aiConfidence.toFixed(2)}）${detection.aiReason ? ` 理由：${detection.aiReason}` : ""}`
+      : "");
 
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback("✅ 通过", `approve:${id}`), Markup.button.callback("❌ 拒绝", `reject:${id}`)],
@@ -877,6 +861,7 @@ async function handleAdminInput(ctx: any, adminId: number) {
         if (thr!==undefined && (Number.isNaN(thr) || thr<0 || thr>1)) return void await safeCall(()=>ctx.reply("❌ 阈值应在 0~1 之间"));
         templates.push({ name, content, threshold: (Number.isFinite(Number(thr)) ? Number(thr) : (cfg.adtplDefaultThreshold ?? 0.5)) });
         await store.setTemplates(templates);
+        syncDetectAdContext();
         await safeCall(()=>ctx.reply(`✅ 已添加：${name}`, buildSubmenu("adtpl")));
         break;
       }
@@ -890,6 +875,7 @@ async function handleAdminInput(ctx: any, adminId: number) {
         }
         templates[idx] = { name, content, threshold: (Number.isFinite(Number(thr)) ? Number(thr) : (cfg.adtplDefaultThreshold ?? 0.5)) };
         await store.setTemplates(templates);
+        syncDetectAdContext();
         await safeCall(()=>ctx.reply(`✅ 已更新 #${idx + 1}`, buildSubmenu("adtpl")));
         break;
       }
@@ -897,19 +883,27 @@ async function handleAdminInput(ctx: any, adminId: number) {
         const idx = Number(raw)-1;
         if (Number.isNaN(idx)||idx<0||idx>=templates.length) return void await safeCall(()=>ctx.reply("❌ 序号越界"));
         const t = templates[idx]; templates.splice(idx,1); await store.setTemplates(templates);
+        syncDetectAdContext();
         await safeCall(()=>ctx.reply(`✅ 已删除：${t.name}`, buildSubmenu("adtpl")));
         break;
       }
       case "adtpl_test": {
         const text = raw;
-        const norm = normalizeText(text); const a = ngrams(norm, norm.length>=3?3:2);
-        let best = { idx:-1, name:"", score:0, thr: cfg.adtplDefaultThreshold ?? 0.6 };
-        templates.forEach((tpl, i)=>{
-          const b = ngrams(normalizeText(tpl.content), tpl.content.length>=3?3:2);
-          const score = jaccard(a,b); if (score>best.score) best = { idx:i, name:tpl.name, score, thr: tpl.threshold ?? cfg.adtplDefaultThreshold ?? 0.6 };
-        });
-        if (best.idx>=0) await safeCall(()=>ctx.reply(`最佳匹配：#${best.idx+1} ${best.name}  score=${best.score.toFixed(3)}  thr=${best.thr}`));
-        else await safeCall(()=>ctx.reply("无模板"));
+        const detection = await detectAd(text);
+        const bestIdx = templates.findIndex((tpl) => tpl.name === detection.legacyTemplateName);
+        const thr = bestIdx >= 0
+          ? (templates[bestIdx].threshold ?? cfg.adtplDefaultThreshold ?? 0.6)
+          : cfg.adtplDefaultThreshold ?? 0.6;
+        const lines: string[] = [];
+        if (bestIdx >= 0 && detection.legacyScore !== undefined) {
+          lines.push(`最佳匹配：#${bestIdx + 1} ${detection.legacyTemplateName}  score=${detection.legacyScore.toFixed(3)}  thr=${thr}`);
+        } else {
+          lines.push("无模板命中");
+        }
+        if (detection.aiConfidence !== undefined) {
+          lines.push(`AI 判断：${detection.isAd ? "广告" : "非广告"}（${detection.aiConfidence.toFixed(2)}）${detection.aiReason ? ` 理由：${detection.aiReason}` : ""}`);
+        }
+        await safeCall(()=>ctx.reply(lines.join("\n")));
         break;
       }
       case "adtpl_thr": {
@@ -917,6 +911,7 @@ async function handleAdminInput(ctx: any, adminId: number) {
         if (Number.isNaN(thr)||thr<0||thr>1) return void await safeCall(()=>ctx.reply("❌ 阈值应在 0~1 之间"));
         cfg.adtplDefaultThreshold = thr;
         await store.setConfig({ adtplDefaultThreshold: thr } as any);
+        syncDetectAdContext();
         await safeCall(()=>ctx.reply(`✅ 全局阈值已更新为 ${thr}`, buildSubmenu("adtpl")));
         break;
       }
