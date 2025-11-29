@@ -68,21 +68,14 @@ bot.use(async (ctx, next) => {
   }
 });
 // ===== INJECTED_ADMIN_MW: END =====
-    
-  
+
 bot.use(async (ctx, next) => {
   try {
     await next();
   } finally {
     if ("callback_query" in ctx.update) {
-      try { await ctx.answerCbQuery(); } catch (e) {}
+      try { await ctx.answerCbQuery(); } catch (e) { /* ignore */ }
     }
-  }
-});
-bot.use(async (ctx, next) => {
-  await next();
-  if ("callback_query" in ctx.update) {
-    try { await ctx.answerCbQuery(); } catch (e) {}
   }
 });
 const app = express();
@@ -100,63 +93,6 @@ function buildReplyKeyboard(isAdmin: boolean = false) {
   ]).resize(true).oneTime(false);
 }
 // ===== BOTTOM_KB6: END =====
-
-/* ===== Stable forwarding guard: only forward matched templates ===== */
-
-// —— 基础工具 —— //
-function isPrivate(ctx: any) {
-  return ctx.chat?.type === 'private';
-}
-function isCommandText(s?: string) {
-  return !!s && s.startsWith('/');
-}
-function getMessageText(ctx: any): string {
-  const m = (ctx.message || ctx.channelPost || ctx.editedMessage || ctx.editedChannelPost) as any;
-  return m?.text || m?.caption || '';
-}
-function isTooOldCtx(ctx: any, maxAgeSec: number) {
-  const m = (ctx.message || ctx.channelPost || ctx.editedMessage || ctx.editedChannelPost) as any;
-  if (!m?.date) return false;
-  const age = Math.floor(Date.now() / 1000) - Number(m.date);
-  return age > maxAgeSec;
-}
-// 来源白名单（你文件里已有 sourcesAllow: Set<string>）
-async function isAllowedSource(ctx: any, sourcesAllow: Set<string>) {
-  const chat = ctx.chat || {};
-  const uname = chat.username ? `@${chat.username}`.toLowerCase() : '';
-  const idStr = chat.id ? String(chat.id) : '';
-  if (sourcesAllow.size === 0) return true;  // 未配置白名单则放行到下一步
-  return sourcesAllow.has(uname) || sourcesAllow.has(idStr);
-}
-
-// —— 简单模板匹配 —— //
-// 用当前已保存的 templates 和 (tpl.threshold || cfg.adtplDefaultThreshold || 0.6)
-// 以"模板内容里的字段命中比例"做粗匹配（不依赖其它私有函数，避免编译找不到）
-function textMatchesTemplates(text: string): boolean {
-  if (!text) return false;
-  if (!templates || templates.length === 0) return false;
-
-  const norm = text.replace(/\s+/g, '');
-  for (const tpl of templates) {
-    const content = (tpl as any).content || '';
-    const thr = Number((tpl as any).threshold ?? (cfg?.adtplDefaultThreshold ?? 0.6));
-    const parts = String(content).split(/\n+/).map(s => s.trim()).filter(Boolean);
-    if (parts.length === 0) continue;
-
-    let hit = 0, need = 0;
-    for (let p of parts) {
-      const bare = p.replace(/[:：]\s*$/, ''); // "价格：" -> "价格"
-      if (!bare) continue;
-      need++;
-      if (norm.includes(bare.replace(/\s+/g, ''))) hit++;
-    }
-    const score = need ? hit / need : 0;
-    if (need && score >= thr) return true;
-  }
-  return false;
-}
-
-
 
 // -------- Metrics ----------
 const START_TS = Date.now();
@@ -185,11 +121,140 @@ const MAX_MESSAGE_AGE_SEC = Number(process.env.MAX_MESSAGE_AGE_SEC || 86400);
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase();
 const STRICT_ENV = String(process.env.STRICT_TEMPLATE || "").toLowerCase();
 
-const limiter = new Bottleneck({ minTime: GLOBAL_MIN_TIME_MS, maxConcurrent: 1 });
+const limiter = new Bottleneck({ minTime: 500, maxConcurrent: 1 }); // API 调用间隔 500ms
 const safeCall = async <T,>(fn: () => Promise<T>): Promise<T | undefined> => {
   try { return await limiter.schedule(fn); } catch (e) { console.error(e); return; }
 };
 const debug = (...args: any[]) => { if (LOG_LEVEL === "debug") console.log("[DEBUG]", ...args); };
+
+// ===== AI 审核配置 =====
+const USE_AI_REVIEW = process.env.USE_AI_REVIEW === "1";
+const AI_API_KEY = process.env.AI_API_KEY || "";
+const AI_MODEL = process.env.AI_MODEL || "gpt-4.1-mini";
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 4000);
+
+async function callAIReview(text: string, templateName?: string, hasMedia?: boolean): Promise<{ isAd: boolean; type?: string; reason?: string } | null> {
+  if (!AI_API_KEY) return { isAd: true, reason: "AI_API_KEY 未配置" };
+  
+  const prompt = `你是广告内容审核助手。请判断以下消息是否为广告。
+
+广告类型包括:
+1. 出售类: 卖东西、商品转让、二手交易、出售信息
+2. 求购类: 收购、求购、想买、收一个
+3. 服务推广: 会所、按摩、休闲服务、商家宣传
+
+消息内容:
+"""
+${text}
+"""
+${hasMedia ? "（消息附带图片/视频）" : ""}
+${templateName ? `提示: 已匹配模板 "${templateName}"` : ""}
+
+判断规则:
+- 包含价格、联系方式、商品描述 → 可能是广告
+- 包含"出"、"收"、"卖"、"买" + 具体物品 → 可能是广告
+- 普通聊天、问答、讨论 → 非广告
+
+如果是广告，回复: {"isAd": true, "type": "出售/求购/推广", "reason": "简短说明"}
+如果不是广告，回复: {"isAd": false, "reason": "简短说明"}`;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+    
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${AI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: AI_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 100,
+        temperature: 0.3
+      }),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeout);
+    
+    if (!response.ok) {
+      console.error("[AI] API 错误:", response.status);
+      return { isAd: true, reason: `API 错误: ${response.status}` };
+    }
+    
+    const data = await response.json() as any;
+    const content = data.choices?.[0]?.message?.content || "";
+    
+    // 尝试解析 JSON
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const result = JSON.parse(jsonMatch[0]);
+      console.log("[AI] 审核结果:", result);
+      return { isAd: !!result.isAd, reason: result.reason };
+    }
+    
+    // 解析失败时返回 null，让调用方决定降级策略
+    console.warn("[AI] 响应解析失败，使用降级策略");
+    return null;
+  } catch (err: any) {
+    console.error("[AI] 调用失败:", err.message);
+    // 调用失败时返回 null，让调用方使用模板匹配结果
+    return null;
+  }
+}
+
+if (USE_AI_REVIEW) console.log(`[AI] 已启用 AI 审核 (模型: ${AI_MODEL})`);
+
+// OCR: 从图片中提取文字
+async function extractTextFromImage(fileId: string): Promise<string> {
+  if (!AI_API_KEY) return "";
+  
+  try {
+    // 获取图片文件信息
+    const file = await bot.telegram.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
+    
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS * 2);
+    
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${AI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "提取图片中的所有文字内容，如果没有文字则描述图片内容。简洁输出，不要解释。" },
+            { type: "image_url", image_url: { url: fileUrl } }
+          ]
+        }],
+        max_tokens: 500
+      }),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeout);
+    
+    if (!response.ok) {
+      console.error("[OCR] API 错误:", response.status);
+      return "";
+    }
+    
+    const data = await response.json() as any;
+    const content = data.choices?.[0]?.message?.content || "";
+    console.log("[OCR] 提取结果:", content.substring(0, 100) + "...");
+    return content;
+  } catch (err: any) {
+    console.error("[OCR] 调用失败:", err.message);
+    return "";
+  }
+}
 
 /** ====== Store & Config ====== */
 const store: Store = buildStore();
@@ -231,6 +296,7 @@ async function persistMetrics() {
 // Dedup & cooldown
 const dedup = new Map<string, number>();
 const userCooldown = new Map<number, number>();
+const mediaGroupDedup = new Map<string, number>(); // 媒体组去重
 
 // 使用新的权限工具（支持环境变量 ADMIN_IDS/ADMIN_ID 和可选的数据库管理员）
 async function isAdmin(id?: number): Promise<boolean> {
@@ -352,17 +418,41 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   return uni===0?0:inter/uni;
 }
 function detectAdTemplate(text: string): { matched: boolean; name?: string; score?: number } {
-  const norm = normalizeText(text); if (!norm) return { matched:false };
-  const a = ngrams(norm, norm.length >=3 ? 3 : 2);
+  const norm = normalizeText(text);
+  if (!norm) return { matched: false };
+  
+  // 根据文本长度选择 N-gram 大小
+  const ngramSize = norm.length >= 10 ? 3 : 2;
+  const a = ngrams(norm, ngramSize);
+  
   let best = { name: "", score: 0, thr: cfg.adtplDefaultThreshold ?? 0.6 };
+  
   for (const tpl of templates) {
-    const b = ngrams(normalizeText(tpl.content), tpl.content.length>=3?3:2);
-    const score = jaccard(a,b);
+    const tplNorm = normalizeText(tpl.content);
+    const tplNgramSize = tplNorm.length >= 10 ? 3 : 2;
+    const b = ngrams(tplNorm, tplNgramSize);
+    
+    // Jaccard 相似度
+    const jaccardScore = jaccard(a, b);
+    
+    // 关键词包含率 (将模板拆分为词，检查包含比例)
+    const tplChars = [...new Set(tplNorm.split(''))]; // 去重字符
+    const containCount = tplChars.filter(c => norm.includes(c)).length;
+    const containRate = tplChars.length > 0 ? containCount / tplChars.length : 0;
+    
+    // 综合得分: 取两者较高值 (containRate 权重稍低)
+    const score = Math.max(jaccardScore, containRate * 0.85);
+    
     const thr = Math.max(0, Math.min(1, tpl.threshold ?? cfg.adtplDefaultThreshold ?? 0.6));
-    if (score>=thr && score>best.score) best = { name: tpl.name, score, thr };
+    if (score >= thr && score > best.score) {
+      best = { name: tpl.name, score, thr };
+    }
   }
-  if (best.score >= (best.thr || cfg.adtplDefaultThreshold || 0.6)) return { matched:true, name:best.name, score:Number(best.score.toFixed(3)) };
-  return { matched:false };
+  
+  if (best.score >= best.thr) {
+    return { matched: true, name: best.name, score: Number(best.score.toFixed(3)) };
+  }
+  return { matched: false };
 }
 function extractMessageText(msg: any): string {
   // 1. 纯文字消息
@@ -443,13 +533,48 @@ bot.hears(/^菜单$/i, async (ctx)=>{
   return void safeCall(()=>ctx.reply("暂无菜单按钮，管理员可用\"引流按钮→新增\"添加。"));
 });
 bot.hears(/^(❓\s*)?帮助$/i, async (ctx)=> {
-  await safeCall(()=>ctx.reply(
-`🆘 帮助
-• 私聊或在监听的频道/群内发送投稿，命中模板则标记"疑似模板"后进入审核。
-• 管理员审核通过后，转发到目标频道。
-• 点击"菜单"可查看精选导航按钮。
-• 管理员使用"⚙️ 管理设置面板"进行全部配置。`
-  ));
+  const isAdminUser = await isAdmin(ctx.from?.id);
+  
+  if (isAdminUser) {
+    // 管理员帮助 - 完整功能说明
+    await safeCall(()=>ctx.reply(
+`🆘 管理员帮助
+
+📌 底部按钮
+• 设置 - 打开管理面板
+• 统计 - 查看发布统计数据
+• 频道管理 - 设置目标/审核频道
+• 按钮管理 - 管理菜单导航按钮
+• 修改欢迎语 - 自定义欢迎消息
+
+📌 管理面板功能
+• 速率限制 - 控制发送频率
+• 白名单模式 - 只允许特定用户
+• 来源白名单 - 限制来源频道
+• 严格模板 - 未匹配则拒绝
+• 广告模板 - 管理检测模板
+• 管理员 - 添加/移除管理员
+• 白/黑名单 - 用户权限管理
+
+📌 审核操作
+• ✅ 通过 - 转发到目标频道
+• ❌ 拒绝 - 驳回消息
+• ⛔ 封禁 - 拉黑用户
+
+💡 AI 审核${process.env.USE_AI_REVIEW === "1" ? "已启用" : "未启用"}`
+    ));
+  } else {
+    // 普通用户帮助 - 发布说明
+    await safeCall(()=>ctx.reply(
+`📝 发布广告请包含:
+┌ 出售 → 商品+价格+联系方式
+├ 求购 → 物品+预算+联系方式  
+└ 推广 → 服务内容+预约方式
+
+📸 支持文字/图片/视频
+⏳ 管理员审核后自动发布`
+    ));
+  }
   return;
 });
 bot.hears(/^(📊\s*)?统计$/i, async (ctx)=> {
@@ -468,12 +593,30 @@ function isTooOld(msg: any): boolean {
 }
 
 async function handleIncoming(ctx: Context, msg: any, sourceChatId: number|string, messageId: number, fromId?: number) {
+  // 媒体组去重：多图消息只处理第一条
+  const mediaGroupId = (msg as any)?.media_group_id;
+  if (mediaGroupId) {
+    const lastTs = mediaGroupDedup.get(mediaGroupId);
+    if (lastTs && Date.now() - lastTs < 5000) {
+      debug("skip: media group duplicate", mediaGroupId);
+      return;
+    }
+    mediaGroupDedup.set(mediaGroupId, Date.now());
+    // 清理旧记录
+    for (const [k, ts] of mediaGroupDedup) {
+      if (Date.now() - ts > 60000) mediaGroupDedup.delete(k);
+    }
+  }
+
   // 忽略目标/审核频道自身的回流
   if (String(sourceChatId) === String(cfg.forwardTargetId)) { debug("skip: forward target"); return; }
   if (cfg.reviewTargetId && String(sourceChatId) === String(cfg.reviewTargetId)) { debug("skip: review target"); return; }
 
-  // 来源白名单（可选）
-  if (sourcesAllow.size > 0 && !sourcesAllow.has(String(sourceChatId))) {
+  // 判断是否私聊
+  const isPrivateChat = fromId && String(sourceChatId) === String(fromId);
+
+  // 来源白名单（可选）- 私聊消息不受此限制
+  if (sourcesAllow.size > 0 && !isPrivateChat && !sourcesAllow.has(String(sourceChatId))) {
     debug("skip: not in sourcesAllow", sourceChatId);
     return;
   }
@@ -508,8 +651,48 @@ async function handleIncoming(ctx: Context, msg: any, sourceChatId: number|strin
     return;
   }
 
-  const txt = extractMessageText(msg);
-  const hit = detectAdTemplate(txt);
+  let txt = extractMessageText(msg);
+  const hasMedia = !!(msg?.photo || msg?.video || msg?.document || msg?.animation);
+  
+  // OCR: 如果是图片且文字较少，尝试提取图片中的文字
+  if (USE_AI_REVIEW && msg?.photo && txt.length < 20) {
+    const photoArray = msg.photo as any[];
+    const largestPhoto = photoArray[photoArray.length - 1]; // 取最大尺寸
+    if (largestPhoto?.file_id) {
+      const ocrText = await extractTextFromImage(largestPhoto.file_id);
+      if (ocrText) {
+        txt = txt ? `${txt}\n[图片文字]: ${ocrText}` : ocrText;
+      }
+    }
+  }
+  
+  let hit = detectAdTemplate(txt);
+  let aiReason: string | undefined;
+  let aiType: string | undefined;
+
+  // AI 审核（可选）
+  if (USE_AI_REVIEW && (txt.length > 10 || hasMedia)) {
+    const aiResult = await callAIReview(txt, hit.matched ? hit.name : undefined, hasMedia);
+    
+    if (aiResult === null) {
+      // AI 调用失败，使用降级策略：保持原有模板匹配结果
+      console.log("[AI] 降级：使用模板匹配结果");
+      aiReason = "AI 降级";
+    } else {
+      aiReason = aiResult.reason;
+      aiType = aiResult.type;
+      
+      if (hit.matched && !aiResult.isAd) {
+        // 模板匹配但 AI 判断不是广告，取消标记
+        console.log(`[AI] 取消广告标记: ${aiResult.reason}`);
+        hit = { matched: false };
+      } else if (!hit.matched && aiResult.isAd) {
+        // 模板未匹配但 AI 判断是广告，添加标记
+        console.log(`[AI] 标记为广告: ${aiResult.reason}`);
+        hit = { matched: true, name: "AI检测", score: 0.9 };
+      }
+    }
+  }
 
   // 严格模板模式：未命中直接丢弃（可选）
   if (cfg.strictTemplate && !hit.matched) {
@@ -641,15 +824,15 @@ bot.on("callback_query", async (ctx) => {
     if (key === "set_target") return void askOnce(ctx, "请发送 **目标频道ID**（如 -1001234567890）", "set_target");
     if (key === "set_review") return void askOnce(ctx, "请发送 **审核频道ID**（为空则逐个发管理员）", "set_review");
     if (key === "set_welcome") return void askOnce(ctx, "请发送 **欢迎语文本**", "set_welcome");
-    if (key === "rate") return void ctx.editMessageText("🐢 速率限制", buildSubmenu("rate"));
-    if (key === "allowlist") return void ctx.editMessageText("🧾 白名单模式", buildSubmenu("allowlist"));
-    if (key === "sources") return void ctx.editMessageText("🧱 来源白名单", buildSubmenu("sources"));
-    if (key === "strict") return void ctx.editMessageText("📐 严格模板", buildSubmenu("strict"));
-    if (key === "adtpl") return void ctx.editMessageText("🧩 广告模板", buildSubmenu("adtpl"));
-    if (key === "admins") return void ctx.editMessageText("👑 管理员", buildSubmenu("admins"));
-    if (key === "lists") return void ctx.editMessageText("🚷 白/黑名单", buildSubmenu("lists"));
-    if (key === "buttons") return void ctx.editMessageText(`🧲 引流按钮（上限 ${MAX_BUTTONS} 个）`, buildSubmenu("buttons"));
-    if (key === "stats") return void ctx.editMessageText("📊 统计\n\n" + buildStatsText(), buildAdminPanel());
+    if (key === "rate") return void safeCall(() => ctx.editMessageText("🐢 速率限制", buildSubmenu("rate")));
+    if (key === "allowlist") return void safeCall(() => ctx.editMessageText("🧾 白名单模式", buildSubmenu("allowlist")));
+    if (key === "sources") return void safeCall(() => ctx.editMessageText("🧱 来源白名单", buildSubmenu("sources")));
+    if (key === "strict") return void safeCall(() => ctx.editMessageText("📐 严格模板", buildSubmenu("strict")));
+    if (key === "adtpl") return void safeCall(() => ctx.editMessageText("🧩 广告模板", buildSubmenu("adtpl")));
+    if (key === "admins") return void safeCall(() => ctx.editMessageText("👑 管理员", buildSubmenu("admins")));
+    if (key === "lists") return void safeCall(() => ctx.editMessageText("🚷 白/黑名单", buildSubmenu("lists")));
+    if (key === "buttons") return void safeCall(() => ctx.editMessageText(`🧲 引流按钮（上限 ${MAX_BUTTONS} 个）`, buildSubmenu("buttons")));
+    if (key === "stats") return void safeCall(() => ctx.editMessageText("📊 统计\n\n" + buildStatsText(), buildAdminPanel()));
     // ← 在这里添加新代码
 if (key === "view_config") {
   const configText = `📋 当前配置
@@ -665,17 +848,12 @@ if (key === "view_config") {
 🧾 白名单模式：${cfg.allowlistMode ? "✅ 开启" : "❌ 关闭"}
 ⚙️ 全局阈值：${cfg.adtplDefaultThreshold}`;
   
-  return void ctx.editMessageText(configText, buildAdminPanel());
+  return void safeCall(() => ctx.editMessageText(configText, buildAdminPanel()));
 }
 return;
 }  // ← 添加这个结束括号
 
 // —— 子面板操作 —— //
-if (data === "btn:list") {
-  await safeCall(()=>ctx.answerCbQuery());
-  await showButtonsPreview(ctx);
-  return;
-}
   // 引流按钮
   if (data === "btn:list") {
     await safeCall(()=>ctx.answerCbQuery());
@@ -1010,6 +1188,27 @@ async function forwardToTarget(ctx: Context, sourceChatId: number|string, messag
 }
 
 /** ====== Startup ====== */
+
+// 全局错误处理：防止 Bot 因未捕获的异常崩溃
+bot.catch((err, ctx) => {
+  console.error("[BOT ERROR]", err);
+  // 尝试通知管理员
+  if (cfg?.adminIds?.length) {
+    const msg = `⚠️ Bot 错误: ${(err as any)?.message || err}`;
+    for (const admin of cfg.adminIds) {
+      bot.telegram.sendMessage(Number(admin), msg).catch(() => {});
+    }
+  }
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection:', reason);
+});
+
 (async () => {
   await loadAll();
   // ONLY_START_CMDS: 覆盖命令菜单为仅 /start
@@ -1024,12 +1223,36 @@ async function forwardToTarget(ctx: Context, sourceChatId: number|string, messag
       console.log(`✅ Webhook set: ${WEBHOOK_URL}${path}`);
     }).catch((e)=>{
       console.error("设置 Webhook 失败，回退到轮询：", e);
-      bot.launch().then(()=>console.log("✅ Bot started (polling)"));
+      bot.launch()
+        .then(() => console.log("✅ Bot started (polling)"))
+        .catch((err) => console.error("❌ Bot launch failed:", err));
     });
   } else {
-    bot.launch().then(()=>console.log("✅ Bot started (polling)"));
+    console.log("[DEBUG] 开始删除 webhook...");
+    bot.telegram.deleteWebhook({ drop_pending_updates: true })
+      .then(() => {
+        console.log("[DEBUG] Webhook 已删除，启动 polling...");
+        return bot.launch();
+      })
+      .then(() => console.log("✅ Bot started (polling)"))
+      .catch((err) => console.error("❌ Bot launch failed:", err));
   }
   app.listen(PORT, "0.0.0.0", ()=>console.log(`🌐 Listening on ${PORT} (/healthz, /metrics)`));
+  
+  // 定时清理过期审核请求 (每小时执行一次，清理超过24小时的请求)
+  const CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 小时
+  const PENDING_MAX_AGE = 24 * 60 * 60 * 1000; // 24 小时
+  setInterval(async () => {
+    try {
+      const cutoff = Date.now() - PENDING_MAX_AGE;
+      const count = await store.cleanupOldPending(cutoff);
+      if (count > 0) console.log(`[CLEANUP] 已清理 ${count} 条过期审核请求`);
+    } catch (err) {
+      console.error("[CLEANUP] 清理失败:", err);
+    }
+  }, CLEANUP_INTERVAL);
+  console.log("[CLEANUP] 过期清理任务已启动 (每小时执行)");
+  
   process.once("SIGINT", ()=>bot.stop("SIGINT"));
   process.once("SIGTERM", ()=>bot.stop("SIGTERM"));
 })();

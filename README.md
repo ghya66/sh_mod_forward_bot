@@ -1,55 +1,131 @@
-# Telegram Moderated Forward Bot (Redis/SQLite)
+# Telegram 广告审核转发机器人
 
-一个可在 Render 部署的 Telegram 机器人：
-- 审核转发（管理员通过后转发到目标频道）
-- 审核频道（REVIEW_TARGET_ID）统一收审
-- 引流按钮（管理员在 bot 内编辑）
-- 欢迎语、菜单（回复键盘 + inline 键盘）
-- 模糊广告模板检测（3-gram Jaccard）
+一个功能完整的 Telegram 广告审核机器人，支持 AI 智能审核、图片 OCR 识别。
+
+## 功能特性
+
+### 核心功能
+- **广告审核转发** - 管理员审核通过后转发到目标频道
+- **AI 智能审核** - 自动识别出售/求购/推广类广告
+- **图片 OCR** - 提取图片中的文字内容进行识别
+- **模板匹配** - 基于 N-gram + Jaccard 相似度的广告检测
+- **引流按钮** - 自定义菜单导航按钮
+
+### 管理功能
 - 速率限制（全局 + 每用户冷却）
-- **持久化：Redis 或 SQLite（二选一）**
+- 白名单/黑名单管理
+- 来源白名单（限制消息来源）
+- 严格模板模式（未匹配则拒绝）
+- 多管理员支持
 
-## 环境变量
-见 `.env.example`。
+### 稳定性功能
+- 全局错误处理
+- AI 降级策略
+- 数据库重试机制
+- 过期请求自动清理
 
-- Redis：设置 `PERSIST_BACKEND=redis` 且提供 `REDIS_URL`
-- SQLite：设置 `PERSIST_BACKEND=sqlite` 且提供 `SQLITE_PATH`（挂载持久化磁盘到该路径所在目录）
+---
 
-## Render 配置
-- Build: `npm ci && npm run build`
-- Start: `npm run start`
-- Health Check Path: `/healthz`
+## 快速开始
 
-## 管理命令（在 Telegram 内）
-- `/config` 查看配置
-- `/set_review_target <id>` 设置审核频道/群/用户 ID（留空关闭→逐个发管理员）
-- `/set_target <id>` 设置最终转发目标 ID
-- `/set_welcome <文本>` 设置欢迎语
-- `/set_attach_buttons 1|0` 审核通过后的说明是否附带引流按钮
-- `/set_rate <per_user_ms> <global_min_ms>` 速率参数（建议重启后更稳）
-- `/toggle_allowlist 1|0` 白名单模式开关
-- `/admins_list` `/admins_add <id>` `/admins_del <id>` 管理管理员列表
+### 环境要求
+- Node.js 18+
+- npm 或 yarn
 
-### 引流按钮
-- `/btn_list`
-- `/btn_add "显示文字" https://链接 顺序`
-- `/btn_set 序号 "显示文字" https://链接 顺序`
-- `/btn_del 序号`
+### 安装依赖
+```bash
+npm install
+```
 
-### 广告模板
-- `/adtpl_list`
-- `/adtpl_add "名称" "模板内容" 0.6`
-- `/adtpl_set 序号 "名称" "模板内容" 0.7`
-- `/adtpl_del 序号`
-- `/adtpl_test "任意文本"`
+### 配置环境变量
+复制示例配置文件：
+```bash
+cp .env.example .env
+```
 
-## 审核流程
-非管理员消息 → 入待审队列 → 发送“原消息 + 审核按钮”到 `REVIEW_TARGET_ID`（若设置）或逐个管理员 → 通过/拒绝/封禁。通过后将原消息转发到 `FORWARD_TARGET_ID`。
+编辑 `.env` 文件：
+```env
+# 必需配置
+TELEGRAM_BOT_TOKEN=你的Bot Token
+FORWARD_TARGET_ID=目标频道ID
+ADMIN_IDS=管理员ID1,管理员ID2
 
-## 权限
-只有管理员（`ADMIN_IDS` 初始 + 后续通过命令维护）能执行配置与审核按钮操作。
+# 可选配置
+REVIEW_TARGET_ID=审核频道ID
+PERSIST_BACKEND=sqlite
+SQLITE_PATH=./data/bot.db
 
-## 注意
-- 目标为频道时必须将机器人设为管理员
-- 若要接收群普通消息，BotFather `/setprivacy` 关闭隐私模式
-- 如果使用 SQLite，务必在 Render 上给该 Web 服务挂载 **Persistent Disk**，并将 `SQLITE_PATH` 指向磁盘目录下的 db 文件（例如 `/data/bot.db`）。
+# AI 审核（可选）
+USE_AI_REVIEW=1
+AI_API_KEY=你的OpenAI API Key
+AI_MODEL=gpt-4.1-mini
+```
+
+### 本地运行
+```bash
+npm run build
+npm run start
+```
+
+---
+
+## 部署
+
+详细部署指南请查看 [docs/DEPLOY.md](docs/DEPLOY.md)
+
+支持的部署方式：
+- **Render** - 云平台一键部署
+- **VPS** - 使用 PM2 管理进程
+- **Docker** - 容器化部署
+
+---
+
+## 使用说明
+
+### 普通用户
+直接向 Bot 发送消息即可提交广告：
+- **出售类** - 商品+价格+联系方式
+- **求购类** - 物品+预算+联系方式
+- **推广类** - 服务内容+预约方式
+
+支持文字、图片、视频。
+
+### 管理员
+点击底部按钮进行管理：
+- **设置** - 打开管理面板
+- **统计** - 查看发布统计
+- **频道管理** - 设置目标/审核频道
+- **按钮管理** - 管理菜单导航按钮
+- **修改欢迎语** - 自定义欢迎消息
+
+### 审核操作
+- ✅ **通过** - 转发到目标频道
+- ❌ **拒绝** - 驳回消息
+- ⛔ **封禁** - 拉黑用户
+
+---
+
+## API 费用估算
+
+使用 `gpt-4.1-mini` 模型：
+
+| 审核数量 | 预估费用 |
+|----------|----------|
+| 1,000 条 | ~$0.08 |
+| 10,000 条 | ~$0.75 |
+| 100,000 条 | ~$7.50 |
+
+---
+
+## 注意事项
+
+1. 目标为频道时，必须将机器人设为管理员
+2. 若要接收群普通消息，需在 BotFather 关闭隐私模式 (`/setprivacy`)
+3. 使用 SQLite 时，确保数据目录有写入权限
+4. AI 审核需要有效的 OpenAI API Key
+
+---
+
+## 许可证
+
+MIT License

@@ -47,3 +47,13 @@ services:
         value: sqlite
       - key: SQLITE_PATH
         value: /data/bot.db
+
+      # —— AI 审核配置 ——
+      - key: USE_AI_REVIEW
+        value: "1"
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_MODEL
+        value: gpt-4.1-mini
+      - key: AI_TIMEOUT_MS
+        value: "4000"

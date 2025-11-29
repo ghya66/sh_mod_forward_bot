@@ -2,6 +2,21 @@ import type { Config, TrafficBtn, AdTemplate, Req } from "./types";
 import Redis from "ioredis";
 import Database from "better-sqlite3";
 
+// 重试机制：用于处理数据库锁定等临时错误
+async function withRetry<T>(fn: () => T | Promise<T>, retries = 3, delay = 100): Promise<T> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const isRetryable = err?.code === 'SQLITE_BUSY' || err?.message?.includes('database is locked');
+      if (i === retries - 1 || !isRetryable) throw err;
+      console.warn(`[DB] 操作失败，重试 ${i + 1}/${retries}:`, err.message);
+      await new Promise(r => setTimeout(r, delay * (i + 1)));
+    }
+  }
+  throw new Error('重试次数用尽');
+}
+
 export interface Store {
   init(): Promise<void>;
   // config
@@ -24,6 +39,7 @@ export interface Store {
   getPending(id: string): Promise<Req | null>;
   setPending(req: Req): Promise<void>;
   delPending(id: string): Promise<void>;
+  cleanupOldPending(cutoffTimestamp: number): Promise<number>;
 }
 
 function defaultConfig(env: NodeJS.ProcessEnv): Config {
@@ -102,6 +118,22 @@ export class RedisStore implements Store {
   async delPending(id: string) {
     await this.r.hdel(this.k("pending"), id);
   }
+  
+  async cleanupOldPending(cutoffTimestamp: number): Promise<number> {
+    // Redis 版本：遍历所有 pending 并删除过期的
+    const all = await this.r.hgetall(this.k("pending"));
+    let count = 0;
+    for (const [id, raw] of Object.entries(all)) {
+      try {
+        const req = JSON.parse(raw);
+        if (req.createdAt < cutoffTimestamp) {
+          await this.r.hdel(this.k("pending"), id);
+          count++;
+        }
+      } catch {}
+    }
+    return count;
+  }
 }
 
 /* ---------------- SQLite Store ---------------- */
@@ -159,9 +191,11 @@ export class SqliteStore implements Store {
   async setConfig(partial: Partial<Config> | Config) {
     const current = await this.getConfig();
     const next = { ...current, ...partial };
-    this.db.prepare(
-      "INSERT INTO config(key, value) VALUES ('config', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
-    ).run(JSON.stringify(next));
+    await withRetry(() => {
+      this.db.prepare(
+        "INSERT INTO config(key, value) VALUES ('config', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+      ).run(JSON.stringify(next));
+    });
   }
 
   async listButtons(): Promise<TrafficBtn[]> {
@@ -169,12 +203,14 @@ export class SqliteStore implements Store {
     return rows as TrafficBtn[];
   }
   async setButtons(btns: TrafficBtn[]) {
-    const trx = this.db.transaction((arr: TrafficBtn[]) => {
-      this.db.prepare("DELETE FROM buttons").run();
-      const stmt = this.db.prepare("INSERT INTO buttons(text, url, ord) VALUES (?, ?, ?)");
-      for (const b of arr) stmt.run(b.text, b.url, b.order);
+    await withRetry(() => {
+      const trx = this.db.transaction((arr: TrafficBtn[]) => {
+        this.db.prepare("DELETE FROM buttons").run();
+        const stmt = this.db.prepare("INSERT INTO buttons(text, url, ord) VALUES (?, ?, ?)");
+        for (const b of arr) stmt.run(b.text, b.url, b.order);
+      });
+      trx(btns);
     });
-    trx(btns);
   }
 
   async listTemplates(): Promise<AdTemplate[]> {
@@ -182,12 +218,14 @@ export class SqliteStore implements Store {
     return rows as AdTemplate[];
   }
   async setTemplates(tpls: AdTemplate[]) {
-    const trx = this.db.transaction((arr: AdTemplate[]) => {
-      this.db.prepare("DELETE FROM templates").run();
-      const stmt = this.db.prepare("INSERT INTO templates(name, content, threshold) VALUES (?, ?, ?)");
-      for (const t of arr) stmt.run(t.name, t.content, t.threshold);
+    await withRetry(() => {
+      const trx = this.db.transaction((arr: AdTemplate[]) => {
+        this.db.prepare("DELETE FROM templates").run();
+        const stmt = this.db.prepare("INSERT INTO templates(name, content, threshold) VALUES (?, ?, ?)");
+        for (const t of arr) stmt.run(t.name, t.content, t.threshold);
+      });
+      trx(tpls);
     });
-    trx(tpls);
   }
 
   async listAllow(): Promise<number[]> {
@@ -234,22 +272,30 @@ export class SqliteStore implements Store {
     return req;
   }
   async setPending(req: Req) {
-    this.db.prepare(
-      `INSERT OR REPLACE INTO pending(id, sourceChatId, messageId, fromId, fromName, createdAt, suspected_template, suspected_score)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      req.id,
-      String(req.sourceChatId),
-      req.messageId,
-      req.fromId,
-      req.fromName,
-      req.createdAt,
-      req.suspected?.template ?? null,
-      req.suspected?.score ?? null
-    );
+    await withRetry(() => {
+      this.db.prepare(
+        `INSERT OR REPLACE INTO pending(id, sourceChatId, messageId, fromId, fromName, createdAt, suspected_template, suspected_score)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        req.id,
+        String(req.sourceChatId),
+        req.messageId,
+        req.fromId,
+        req.fromName,
+        req.createdAt,
+        req.suspected?.template ?? null,
+        req.suspected?.score ?? null
+      );
+    });
   }
   async delPending(id: string) {
     this.db.prepare("DELETE FROM pending WHERE id=?").run(id);
+  }
+  
+  // 清理过期的 pending 请求
+  async cleanupOldPending(cutoffTimestamp: number): Promise<number> {
+    const result = this.db.prepare("DELETE FROM pending WHERE createdAt < ?").run(cutoffTimestamp);
+    return result.changes;
   }
 }
 

@@ -1,16 +1,34 @@
+# 敏感配置 - 绝对不要提交
+.env
 
-# local backups
-backup/
-*.bak
+# 依赖
+node_modules/
 
-# local backups & build artifacts
+# 编译输出
+dist/
+
+# 数据库
+data/
+*.db
+
+# 日志
+*.log
+build.log
+
+# 备份文件
 backup/
 *.bak
 *.fixbak.*
 *.fixpre.*
 *.dedupe.*
 *.tmp
-build.log
 *.yaml.bak
 sh_bot*.patch
-dist/
+
+# IDE
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
